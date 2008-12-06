@@ -26,6 +26,7 @@ class RequestHandler < AbstractRequestHandler
 	
 	def initialize(owner_pipe, options = {})
 		super(owner_pipe, options)
+		@guard = Mutex.new
 		NINJA_PATCHING_LOCK.synchronize do
 			ninja_patch_action_controller
 		end
@@ -35,6 +36,14 @@ protected
 	# Overrided method.
 	def process_request(headers, input, output)
 		cgi = CGIFixed.new(headers, input, output)
+				if ActionController::Base.allow_concurrency
+			dispatch_unlocked cgi
+		else
+			@guard.synchronize { dispatch_unlocked }
+		end
+	end
+	
+	def dispatch_unlocked cgi
 		::Dispatcher.dispatch(cgi,
 			::ActionController::CgiRequest::DEFAULT_SESSION_OPTIONS,
 			cgi.stdoutput)

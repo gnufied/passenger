@@ -80,171 +80,186 @@ module Passenger
 # The web server transforms the HTTP request to the aforementioned format,
 # and sends it to the request handler.
 class AbstractRequestHandler
-  # Signal which will cause the Rails application to exit immediately.
-  HARD_TERMINATION_SIGNAL = "SIGTERM"
-  # Signal which will cause the Rails application to exit as soon as it's done processing a request.
-  SOFT_TERMINATION_SIGNAL = "SIGUSR1"
-  BACKLOG_SIZE    = 50
-  MAX_HEADER_SIZE = 128 * 1024
+	# Signal which will cause the Rails application to exit immediately.
+	HARD_TERMINATION_SIGNAL = "SIGTERM"
+	# Signal which will cause the Rails application to exit as soon as it's done processing a request.
+	SOFT_TERMINATION_SIGNAL = "SIGUSR1"
+	BACKLOG_SIZE    = 50
+	MAX_HEADER_SIZE = 128 * 1024
+	
+	# String constants which exist to relieve Ruby's garbage collector.
+	IGNORE              = 'IGNORE'              # :nodoc:
+	DEFAULT             = 'DEFAULT'             # :nodoc:
+	NULL                = "\0"                  # :nodoc:
+	CONTENT_LENGTH      = 'CONTENT_LENGTH'      # :nodoc:
+	HTTP_CONTENT_LENGTH = 'HTTP_CONTENT_LENGTH' # :nodoc:
+	X_POWERED_BY        = 'X-Powered-By'        # :nodoc:
+	REQUEST_METHOD      = 'REQUEST_METHOD'      # :nodoc:
+	PING                = 'ping'                # :nodoc:
+	
+	# The name of the socket on which the request handler accepts
+	# new connections. At this moment, this value is always the filename
+	# of a Unix domain socket.
+	#
+	# See also #socket_type.
+	attr_reader :socket_name
+	
+	# The type of socket that #socket_name refers to. At the moment, the
+	# value is always 'unix', which indicates a Unix domain socket.
+	attr_reader :socket_type
+	
+	# Specifies the maximum allowed memory usage, in MB. If after having processed
+	# a request AbstractRequestHandler detects that memory usage has risen above
+	# this limit, then it will gracefully exit (that is, exit after having processed
+	# all pending requests).
+	#
+	# A value of 0 (the default) indicates that there's no limit.
+	attr_accessor :memory_limit
+	
+	# The number of times the main loop has iterated so far. Mostly useful
+	# for unit test assertions.
+	attr_reader :iterations
+	
+	# Number of requests processed so far. This includes requests that raised
+	# exceptions.
+	attr_reader :processed_requests
+	
+	# Create a new RequestHandler with the given owner pipe.
+	# +owner_pipe+ must be the readable part of a pipe IO object.
+	#
+	# Additionally, the following options may be given:
+	# - memory_limit: Used to set the +memory_limit+ attribute.
+	def initialize(owner_pipe, options = {})
+		@socket_type = 'unix'
+		create_unix_socket_on_filesystem
+		@socket.close_on_exec!
+		@owner_pipe = owner_pipe
+		@previous_signal_handlers = {}
+		@main_loop_thread_lock = Mutex.new
+		@main_loop_thread_cond = ConditionVariable.new
+		@memory_limit = options["memory_limit"] || 0
+		@iterations = 0
+		@processed_requests = 0
+		@workers = ThreadGroup.new
+		# number of allowed active threads
+		@allowed_processors = 128
+	end
+	
+	# Clean up temporary stuff created by the request handler.
+	#
+	# If the main loop was started by #main_loop, then this method may only
+	# be called after the main loop has exited.
+	#
+	# If the main loop was started by #start_main_loop_thread, then this method
+	# may be called at any time, and it will stop the main loop thread.
+	def cleanup
+		if @main_loop_thread
+			@main_loop_thread.raise(Interrupt.new("Cleaning up"))
+			@main_loop_thread.join
+		end
+		@socket.close rescue nil
+		@owner_pipe.close rescue nil
+		File.unlink(@socket_name) rescue nil
+	end
+	
+	# Check whether the main loop's currently running.
+	def main_loop_running?
+		return @main_loop_running
+	end
+	
+	# Enter the request handler's main loop.
+	def main_loop
+		if defined?(::Passenger::AbstractRequestHandler)
+			# Some applications have a model named 'Passenger'.
+			# So we temporarily remove it from the global namespace
+			# and restore it later.
+			phusion_passenger_namespace = ::Passenger
+			Object.send(:remove_const, :Passenger)
+		end
+		reset_signal_handlers
+		begin
+			@graceful_termination_pipe = IO.pipe
+			@graceful_termination_pipe[0].close_on_exec!
+			@graceful_termination_pipe[1].close_on_exec!
+			
+			@main_loop_thread_lock.synchronize do
+				@main_loop_running = true
+				@main_loop_thread_cond.broadcast
+			end
+			install_useful_signal_handlers
+			process_incoming_message
+		rescue EOFError
+			# Exit main loop.
+		rescue Interrupt
+			# Exit main loop.
+		rescue SignalException => signal
+			if signal.message != HARD_TERMINATION_SIGNAL &&
+			   signal.message != SOFT_TERMINATION_SIGNAL
+				raise
+			end
+		ensure
+			@graceful_termination_pipe[0].close rescue nil
+			@graceful_termination_pipe[1].close rescue nil
+			revert_signal_handlers
+			if phusion_passenger_namespace
+				Object.send(:remove_const, :Passenger) rescue nil
+				Object.const_set(:Passenger, phusion_passenger_namespace)
+			end
+			@main_loop_thread_lock.synchronize do
+				@main_loop_running = false
+				@main_loop_thread_cond.broadcast
+			end
+		end
+	end
 
-  # String constants which exist to relieve Ruby's garbage collector.
-  IGNORE              = 'IGNORE'              # :nodoc:
-  DEFAULT             = 'DEFAULT'             # :nodoc:
-  NULL                = "\0"                  # :nodoc:
-  CONTENT_LENGTH      = 'CONTENT_LENGTH'      # :nodoc:
-  HTTP_CONTENT_LENGTH = 'HTTP_CONTENT_LENGTH' # :nodoc:
-  X_POWERED_BY        = 'X-Powered-By'        # :nodoc:
-  REQUEST_METHOD      = 'REQUEST_METHOD'      # :nodoc:
-  PING                = 'ping'                # :nodoc:
+	# wait for incoming messages in a loop and dispatch to framework handler
+	def process_incoming_message
+		while true
+			@iterations += 1
+			client = accept_connection
+			break unless client
+			begin
+				headers, input = parse_request(client)
+				process_request_async(headers,input,client)
+			# close the underlying unix socket if there was an error while
+			# processing request
+			rescue IOError, SocketError, SystemCallError => e
+				print_exception("Passenger RequestHandler", e)
+				client.close rescue nil
+			rescue
+				client.close rescue nil
+			end
+			@processed_requests += 1
+		end
+	end
 
-  # The name of the socket on which the request handler accepts
-  # new connections. At this moment, this value is always the filename
-  # of a Unix domain socket.
-  #
-  # See also #socket_type.
-  attr_reader :socket_name
+	def process_request_async headers,input,client
+		unless headers
+			client.close rescue nil
+			return
+		end
+		if headers[REQUEST_METHOD] == PING
+			process_ping(headers,input,client)
+			client.close rescue nil
+		else
+			num_workers = @workers.list.length
+			if num_workers >= @allowed_processors
+				reap_dead_workers
+				STDERR.puts("#{Time.now} : Application Instance is overloaded, killing old workers")
+				STDERR.flush
+				client.close rescue nil
+			else
+				thread = Thread.new {
+					process_request(headers,input,client)
+					client.close rescue nil
+				}
+				thread[:started_on] = Time.now
+				@workers.add(thread)
+			end
+		end
+	end
 
-  # The type of socket that #socket_name refers to. At the moment, the
-  # value is always 'unix', which indicates a Unix domain socket.
-  attr_reader :socket_type
-
-  # Specifies the maximum allowed memory usage, in MB. If after having processed
-  # a request AbstractRequestHandler detects that memory usage has risen above
-  # this limit, then it will gracefully exit (that is, exit after having processed
-  # all pending requests).
-  #
-  # A value of 0 (the default) indicates that there's no limit.
-  attr_accessor :memory_limit
-
-  # The number of times the main loop has iterated so far. Mostly useful
-  # for unit test assertions.
-  attr_reader :iterations
-
-  # Number of requests processed so far. This includes requests that raised
-  # exceptions.
-  attr_reader :processed_requests
-
-  # Create a new RequestHandler with the given owner pipe.
-  # +owner_pipe+ must be the readable part of a pipe IO object.
-  #
-  # Additionally, the following options may be given:
-  # - memory_limit: Used to set the +memory_limit+ attribute.
-  def initialize(owner_pipe, options = {})
-    @socket_type = 'unix'
-    create_unix_socket_on_filesystem
-    @socket.close_on_exec!
-    @owner_pipe = owner_pipe
-    @previous_signal_handlers = {}
-    @main_loop_thread_lock = Mutex.new
-    @main_loop_thread_cond = ConditionVariable.new
-    @memory_limit = options["memory_limit"] || 0
-    @iterations = 0
-    @processed_requests = 0
-    @workers = ThreadGroup.new
-  end
-
-  # Clean up temporary stuff created by the request handler.
-  #
-  # If the main loop was started by #main_loop, then this method may only
-  # be called after the main loop has exited.
-  #
-  # If the main loop was started by #start_main_loop_thread, then this method
-  # may be called at any time, and it will stop the main loop thread.
-  def cleanup
-    if @main_loop_thread
-      @main_loop_thread.raise(Interrupt.new("Cleaning up"))
-      @main_loop_thread.join
-    end
-    @socket.close rescue nil
-    @owner_pipe.close rescue nil
-    File.unlink(@socket_name) rescue nil
-  end
-
-  # Check whether the main loop's currently running.
-  def main_loop_running?
-    return @main_loop_running
-  end
-
-  # Enter the request handler's main loop.
-  def main_loop
-    if defined?(::Passenger::AbstractRequestHandler)
-      # Some applications have a model named 'Passenger'.
-      # So we temporarily remove it from the global namespace
-      # and restore it later.
-      phusion_passenger_namespace = ::Passenger
-      Object.send(:remove_const, :Passenger)
-    end
-    reset_signal_handlers
-    begin
-      @graceful_termination_pipe = IO.pipe
-      @graceful_termination_pipe[0].close_on_exec!
-      @graceful_termination_pipe[1].close_on_exec!
-
-      @main_loop_thread_lock.synchronize do
-        @main_loop_running = true
-        @main_loop_thread_cond.broadcast
-      end
-
-      install_useful_signal_handlers
-
-      while true
-        @iterations += 1
-        client = accept_connection
-        if client.nil?
-          break
-        end
-        begin
-          headers, input = parse_request(client)
-          if headers
-            if headers[REQUEST_METHOD] == PING
-              process_ping(headers, input, client)
-            else
-              #process_request(headers, input, client)
-              num_workers = @workers.list.length
-              # currently allow an arbitrary number of 100 active threads
-              # mongrel's value is 950
-              if num_workers >= 100
-                reap_dead_workers
-                STDERR.puts("#{Time.now} : Application Instance is overloaded, killing old workers")
-                STDERR.flush
-              else
-                process_request_async(headers,input,client)
-              end
-            end
-          end
-        rescue IOError, SocketError, SystemCallError => e
-          print_exception("Passenger RequestHandler", e)
-          client.close rescue nil
-        rescue
-          client.close rescue nil
-        end
-        @processed_requests += 1
-      end
-    rescue EOFError
-      # Exit main loop.
-    rescue Interrupt
-      # Exit main loop.
-    rescue SignalException => signal
-      if signal.message != HARD_TERMINATION_SIGNAL &&
-         signal.message != SOFT_TERMINATION_SIGNAL
-        raise
-      end
-    ensure
-      @graceful_termination_pipe[0].close rescue nil
-      @graceful_termination_pipe[1].close rescue nil
-      revert_signal_handlers
-      if phusion_passenger_namespace
-        Object.send(:remove_const, :Passenger) rescue nil
-        Object.const_set(:Passenger, phusion_passenger_namespace)
-      end
-      @main_loop_thread_lock.synchronize do
-        @main_loop_running = false
-        @main_loop_thread_cond.broadcast
-      end
-    end
-  end
-
-  # stolen from mongrel
+	# stolen from mongrel
   def reap_dead_workers
     if @workers.list.length > 0
       STDERR.puts("Reaping #{@workers.list.length} threads for slow workers")
@@ -261,209 +276,194 @@ class AbstractRequestHandler
     end
     return @workers.list.length
   end
-
-  # Start the main loop in a new thread. This thread will be stopped by #cleanup.
-  def start_main_loop_thread
-    @main_loop_thread = Thread.new do
-      main_loop
-    end
-    @main_loop_thread_lock.synchronize do
-      while !@main_loop_running
-        @main_loop_thread_cond.wait(@main_loop_thread_lock)
-      end
-    end
-  end
+	
+	# Start the main loop in a new thread. This thread will be stopped by #cleanup.
+	def start_main_loop_thread
+		@main_loop_thread = Thread.new do
+			main_loop
+		end
+		@main_loop_thread_lock.synchronize do
+			while !@main_loop_running
+				@main_loop_thread_cond.wait(@main_loop_thread_lock)
+			end
+		end
+	end
 
 private
-  include Utils
+	include Utils
 
-  def create_unix_socket_on_filesystem
-    done = false
-    while !done
-      begin
-        if defined?(NativeSupport)
-          unix_path_max = NativeSupport::UNIX_PATH_MAX
-        else
-          unix_path_max = 100
-        end
-        @socket_name = "#{passenger_tmpdir}/passenger_backend.#{generate_random_id(:base64)}"
-        @socket_name = @socket_name.slice(0, unix_path_max - 1)
-        @socket = UNIXServer.new(@socket_name)
-        File.chmod(0600, @socket_name)
-        done = true
-      rescue Errno::EADDRINUSE
-        # Do nothing, try again with another name.
-      end
-    end
-  end
+	def create_unix_socket_on_filesystem
+		done = false
+		while !done
+			begin
+				if defined?(NativeSupport)
+					unix_path_max = NativeSupport::UNIX_PATH_MAX
+				else
+					unix_path_max = 100
+				end
+				@socket_name = "#{passenger_tmpdir}/passenger_backend.#{generate_random_id(:base64)}"
+				@socket_name = @socket_name.slice(0, unix_path_max - 1)
+				@socket = UNIXServer.new(@socket_name)
+				File.chmod(0600, @socket_name)
+				done = true
+			rescue Errno::EADDRINUSE
+				# Do nothing, try again with another name.
+			end
+		end
+	end
 
-  # Reset signal handlers to their default handler, and install some
-  # special handlers for a few signals. The previous signal handlers
-  # will be put back by calling revert_signal_handlers.
-  def reset_signal_handlers
-    Signal.list_trappable.each_key do |signal|
-      begin
-        prev_handler = trap(signal, DEFAULT)
-        if prev_handler != DEFAULT
-          @previous_signal_handlers[signal] = prev_handler
-        end
-      rescue ArgumentError
-        # Signal cannot be trapped; ignore it.
-      end
-    end
-    trap('HUP', IGNORE)
-  end
-
-  def install_useful_signal_handlers
-    trappable_signals = Signal.list_trappable
-
-    trap(SOFT_TERMINATION_SIGNAL) do
-      @graceful_termination_pipe[1].close rescue nil
-    end if trappable_signals.has_key?(SOFT_TERMINATION_SIGNAL.sub(/^SIG/, ''))
-
-    trap('ABRT') do
-      raise SignalException, "SIGABRT"
-    end if trappable_signals.has_key?('ABRT')
-
-    trap('QUIT') do
-      if Kernel.respond_to?(:caller_for_all_threads)
-        output = "========== Process #{Process.pid}: backtrace dump ==========\n"
-        caller_for_all_threads.each_pair do |thread, stack|
-          output << ("-" * 60) << "\n"
-          output << "# Thread: #{thread.inspect}, "
-          if thread == Thread.main
-            output << "[main thread], "
-          else
-            output << "[current thread], "
-          end
-          output << "alive = #{thread.alive?}\n"
-          output << ("-" * 60) << "\n"
-          output << "    " << stack.join("\n    ")
-          output << "\n\n"
-        end
-      else
-        output = "========== Process #{Process.pid}: backtrace dump ==========\n"
-        output << ("-" * 60) << "\n"
-        output << "# Current thread: #{Thread.current.inspect}\n"
-        output << ("-" * 60) << "\n"
-        output << "    " << caller.join("\n    ")
-      end
-      STDERR.puts(output)
-      STDERR.flush
-    end if trappable_signals.has_key?('QUIT')
-  end
-
-  def process_request_async headers,input,client
-    if ActionController::Base.allow_concurrency
-      thread = Thread.new {
-        process_request(headers,input,client)
-        client.close rescue nil
-      }
-      thread[:started_on] = Time.now
-      @workers.add(thread)
-    else
-      process_request(headers,input,client)
-      client.close rescue nil
-    end
-  end
-
-
-  def revert_signal_handlers
-    @previous_signal_handlers.each_pair do |signal, handler|
-      trap(signal, handler)
-    end
-  end
-
-  def accept_connection
-    ios = select([@socket, @owner_pipe, @graceful_termination_pipe[0]]).first
-    if ios.include?(@socket)
-      client = @socket.accept
-      client.close_on_exec!
-
-      # The real input stream is not seekable (calling _seek_
-      # or _rewind_ on it will raise an exception). But some
-      # frameworks (e.g. Merb) call _rewind_ if the object
-      # responds to it. So we simply undefine _seek_ and
-      # _rewind_.
-      client.instance_eval do
-        undef seek if respond_to?(:seek)
-        undef rewind if respond_to?(:rewind)
-      end
-
-      return client
-    else
-      # The other end of the owner pipe has been closed, or the
-      # graceful termination pipe has been closed. This is our
-      # call to gracefully terminate (after having processed all
-      # incoming requests).
-      return nil
-    end
-  end
-
-  # Read the next request from the given socket, and return
-  # a pair [headers, input_stream]. _headers_ is a Hash containing
-  # the request headers, while _input_stream_ is an IO object for
-  # reading HTTP POST data.
-  #
-  # Returns nil if end-of-stream was encountered.
-  def parse_request(socket)
-    channel = MessageChannel.new(socket)
-    headers_data = channel.read_scalar(MAX_HEADER_SIZE)
-    if headers_data.nil?
-      return
-    end
-    headers = Hash[*headers_data.split(NULL)]
-    headers[CONTENT_LENGTH] = headers[HTTP_CONTENT_LENGTH]
-    return [headers, socket]
-  rescue SecurityError => e
-    STDERR.puts("*** Passenger RequestHandler: HTTP header size exceeded maximum.")
-    STDERR.flush
-    print_exception("Passenger RequestHandler", e)
-  end
-
-  def process_ping(env, input, output)
-    output.write("pong")
-  end
-
-  # Generate a long, cryptographically secure random ID string, which
-  # is also a valid filename.
-  def generate_random_id(method)
-    case method
-    when :base64
-      require 'base64' unless defined?(Base64)
-      data = Base64.encode64(File.read("/dev/urandom", 64))
-      data.gsub!("\n", '')
-      data.gsub!("+", '')
-      data.gsub!("/", '')
-      data.gsub!(/==$/, '')
-    when :hex
-      data = File.read("/dev/urandom", 64).unpack('H*')[0]
-    end
-    return data
-  end
-
-  def self.determine_passenger_version
-    rakefile = "#{File.dirname(__FILE__)}/../../Rakefile"
-    if File.exist?(rakefile)
-      File.read(rakefile) =~ /^PACKAGE_VERSION = "(.*)"$/
-      return $1
-    else
-      return File.read("/etc/passenger_version.txt")
-    end
-  end
-
-  def self.determine_passenger_header
-    header = "Phusion Passenger (mod_rails/mod_rack) #{PASSENGER_VERSION}"
-    if File.exist?("#{File.dirname(__FILE__)}/../../enterprisey.txt") ||
-       File.exist?("/etc/passenger_enterprisey.txt")
-      header << ", Enterprise Edition"
-    end
-    return header
-  end
+	# Reset signal handlers to their default handler, and install some
+	# special handlers for a few signals. The previous signal handlers
+	# will be put back by calling revert_signal_handlers.
+	def reset_signal_handlers
+		Signal.list_trappable.each_key do |signal|
+			begin
+				prev_handler = trap(signal, DEFAULT)
+				if prev_handler != DEFAULT
+					@previous_signal_handlers[signal] = prev_handler
+				end
+			rescue ArgumentError
+				# Signal cannot be trapped; ignore it.
+			end
+		end
+		trap('HUP', IGNORE)
+	end
+	
+	def install_useful_signal_handlers
+		trappable_signals = Signal.list_trappable
+		
+		trap(SOFT_TERMINATION_SIGNAL) do
+			@graceful_termination_pipe[1].close rescue nil
+		end if trappable_signals.has_key?(SOFT_TERMINATION_SIGNAL.sub(/^SIG/, ''))
+		
+		trap('ABRT') do
+			raise SignalException, "SIGABRT"
+		end if trappable_signals.has_key?('ABRT')
+		
+		trap('QUIT') do
+			if Kernel.respond_to?(:caller_for_all_threads)
+				output = "========== Process #{Process.pid}: backtrace dump ==========\n"
+				caller_for_all_threads.each_pair do |thread, stack|
+					output << ("-" * 60) << "\n"
+					output << "# Thread: #{thread.inspect}, "
+					if thread == Thread.main
+						output << "[main thread], "
+					else
+						output << "[current thread], "
+					end
+					output << "alive = #{thread.alive?}\n"
+					output << ("-" * 60) << "\n"
+					output << "    " << stack.join("\n    ")
+					output << "\n\n"
+				end
+			else
+				output = "========== Process #{Process.pid}: backtrace dump ==========\n"
+				output << ("-" * 60) << "\n"
+				output << "# Current thread: #{Thread.current.inspect}\n"
+				output << ("-" * 60) << "\n"
+				output << "    " << caller.join("\n    ")
+			end
+			STDERR.puts(output)
+			STDERR.flush
+		end if trappable_signals.has_key?('QUIT')
+	end
+	
+	def revert_signal_handlers
+		@previous_signal_handlers.each_pair do |signal, handler|
+			trap(signal, handler)
+		end
+	end
+	
+	def accept_connection
+		ios = select([@socket, @owner_pipe, @graceful_termination_pipe[0]]).first
+		if ios.include?(@socket)
+			client = @socket.accept
+			client.close_on_exec!
+			
+			# The real input stream is not seekable (calling _seek_
+			# or _rewind_ on it will raise an exception). But some
+			# frameworks (e.g. Merb) call _rewind_ if the object
+			# responds to it. So we simply undefine _seek_ and
+			# _rewind_.
+			client.instance_eval do
+				undef seek if respond_to?(:seek)
+				undef rewind if respond_to?(:rewind)
+			end
+			
+			return client
+		else
+			# The other end of the owner pipe has been closed, or the
+			# graceful termination pipe has been closed. This is our
+			# call to gracefully terminate (after having processed all
+			# incoming requests).
+			return nil
+		end
+	end
+	
+	# Read the next request from the given socket, and return
+	# a pair [headers, input_stream]. _headers_ is a Hash containing
+	# the request headers, while _input_stream_ is an IO object for
+	# reading HTTP POST data.
+	#
+	# Returns nil if end-of-stream was encountered.
+	def parse_request(socket)
+		channel = MessageChannel.new(socket)
+		headers_data = channel.read_scalar(MAX_HEADER_SIZE)
+		if headers_data.nil?
+			return
+		end
+		headers = Hash[*headers_data.split(NULL)]
+		headers[CONTENT_LENGTH] = headers[HTTP_CONTENT_LENGTH]
+		return [headers, socket]
+	rescue SecurityError => e
+		STDERR.puts("*** Passenger RequestHandler: HTTP header size exceeded maximum.")
+		STDERR.flush
+		print_exception("Passenger RequestHandler", e)
+	end
+	
+	def process_ping(env, input, output)
+		output.write("pong")
+	end
+	
+	# Generate a long, cryptographically secure random ID string, which
+	# is also a valid filename.
+	def generate_random_id(method)
+		case method
+		when :base64
+			require 'base64' unless defined?(Base64)
+			data = Base64.encode64(File.read("/dev/urandom", 64))
+			data.gsub!("\n", '')
+			data.gsub!("+", '')
+			data.gsub!("/", '')
+			data.gsub!(/==$/, '')
+		when :hex
+			data = File.read("/dev/urandom", 64).unpack('H*')[0]
+		end
+		return data
+	end
+	
+	def self.determine_passenger_version
+		rakefile = "#{File.dirname(__FILE__)}/../../Rakefile"
+		if File.exist?(rakefile)
+			File.read(rakefile) =~ /^PACKAGE_VERSION = "(.*)"$/
+			return $1
+		else
+			return File.read("/etc/passenger_version.txt")
+		end
+	end
+	
+	def self.determine_passenger_header
+		header = "Phusion Passenger (mod_rails/mod_rack) #{PASSENGER_VERSION}"
+		if File.exist?("#{File.dirname(__FILE__)}/../../enterprisey.txt") ||
+		   File.exist?("/etc/passenger_enterprisey.txt")
+			header << ", Enterprise Edition"
+		end
+		return header
+	end
 
 public
-  PASSENGER_VERSION = determine_passenger_version
-  PASSENGER_HEADER = determine_passenger_header
+	PASSENGER_VERSION = determine_passenger_version
+	PASSENGER_HEADER = determine_passenger_header
 end
 
 end # module Passenger

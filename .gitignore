@@ -31,3 +31,5 @@ test/stub/zsfa/foo
 benchmark/DummyRequestHandler
 benchmark/ApplicationPool
 pkg
+nbproject
+
